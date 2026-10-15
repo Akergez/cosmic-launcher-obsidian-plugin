@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+import sys
+import json
+import os
+import subprocess
+import logging
+import time
+import threading
+import urllib.parse
+
+logging.basicConfig(
+    filename="/tmp/obsidian-search-plugin.log",
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+
+PREFIX = "ob "
+MAX_RESULTS = 20
+GLOBAL_MAX_RESULTS = 5  # без префикса: только по названию, чтобы не забивать выдачу
+GLOBAL_MIN_QUERY = 2
+RESCAN_INTERVAL = 30  # секунд между пересканированием хранилищ
+CONTENT_MIN_QUERY = 3  # поиск по содержимому только для запросов от 3 символов
+ICON = "md.obsidian.Obsidian"
+OBSIDIAN_APP_IDS = {"md.obsidian.obsidian", "obsidian"}
+FOCUS_TIMEOUT = 5  # секунд ждать окно Obsidian после открытия
+
+CONFIG_PATHS = [
+    "~/.var/app/md.obsidian.Obsidian/config/obsidian/obsidian.json",  # flatpak
+    "~/.config/obsidian/obsidian.json",  # нативная установка / AppImage
+    "~/snap/obsidian/current/.config/obsidian/obsidian.json",
+]
+SKIP_DIRS = {".obsidian", ".trash", ".git", "node_modules"}
+
+
+def send(obj):
+    logging.debug("sending: %s", obj)
+    print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+
+def load_vaults():
+    vaults = []
+    seen = set()
+    for p in CONFIG_PATHS:
+        path = os.path.expanduser(p)
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        for v in data.get("vaults", {}).values():
+            vpath = v.get("path")
+            if vpath and vpath not in seen and os.path.isdir(vpath):
+                seen.add(vpath)
+                vaults.append({"path": vpath, "name": os.path.basename(vpath),
+                               "open": v.get("open", False), "ts": v.get("ts", 0)})
+    # открытое хранилище первым, дальше по последнему использованию
+    vaults.sort(key=lambda v: (not v["open"], -v["ts"]))
+    logging.info("vaults: %s", [v["path"] for v in vaults])
+    return vaults
+
+
+class Index:
+    def __init__(self):
+        self.vaults = []
+        self.notes = []
+        self.scanned_at = 0
+        self.content_cache = {}  # path -> (mtime, lowercased text)
+
+    def refresh(self):
+        if time.time() - self.scanned_at < RESCAN_INTERVAL:
+            return
+        self.vaults = load_vaults()
+        notes = []
+        for vault_rank, v in enumerate(self.vaults):
+            for root, dirs, files in os.walk(v["path"]):
+                dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+                for fn in files:
+                    if not fn.endswith(".md"):
+                        continue
+                    full = os.path.join(root, fn)
+                    try:
+                        mtime = os.path.getmtime(full)
+                    except OSError:
+                        continue
+                    rel = os.path.relpath(full, v["path"])
+                    title = fn[:-3]
+                    notes.append({
+                        "path": full,
+                        "rel": rel,
+                        "title": title,
+                        "title_l": title.lower(),
+                        "rel_l": rel.lower(),
+                        "folder": os.path.dirname(rel),
+                        "vault": v["name"],
+                        "vault_rank": vault_rank,
+                        "mtime": mtime,
+                    })
+        self.notes = notes
+        self.scanned_at = time.time()
+        logging.info("indexed %d notes", len(notes))
+
+    def content(self, note):
+        cached = self.content_cache.get(note["path"])
+        if cached and cached[0] == note["mtime"]:
+            return cached[1]
+        try:
+            with open(note["path"], encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+        except OSError:
+            text = ""
+        self.content_cache[note["path"]] = (note["mtime"], text)
+        return text
+
+    def search(self, query, full=True):
+        self.refresh()
+        terms = query.lower().split()
+        limit = MAX_RESULTS if full else GLOBAL_MAX_RESULTS
+        if not terms:
+            recent = sorted(self.notes, key=lambda n: -n["mtime"])
+            return [(n, None) for n in recent[:MAX_RESULTS]]
+
+        scored = []
+        for n in self.notes:
+            score = self.score_name(n, terms, query.lower())
+            snippet = None
+            if score is None and full and len(query) >= CONTENT_MIN_QUERY:
+                text = self.content(n)
+                text_l = text.lower()
+                if all(t in text_l for t in terms):
+                    score = 10
+                    snippet = make_snippet(text, text_l, terms[0])
+            if score is not None:
+                scored.append((score, n, snippet))
+
+        scored.sort(key=lambda s: (-s[0], s[1]["vault_rank"], -s[1]["mtime"]))
+        return [(n, snip) for _, n, snip in scored[:limit]]
+
+    @staticmethod
+    def score_name(n, terms, q):
+        title, rel = n["title_l"], n["rel_l"]
+        if title == q:
+            return 100
+        if title.startswith(q):
+            return 80
+        if q in title:
+            return 60
+        if all(t in title for t in terms):
+            return 50
+        if all(t in rel for t in terms):
+            return 30
+        return None
+
+
+def make_snippet(text, text_l, term, width=70):
+    i = text_l.find(term)
+    if i < 0:
+        return None
+    start = max(0, i - width // 3)
+    snippet = " ".join(text[start:start + width].split())
+    return ("…" if start > 0 else "") + snippet + "…"
+
+
+def open_uri(uri, title, vault):
+    logging.info("opening %s", uri)
+    subprocess.Popen(["xdg-open", uri], stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+    if os.environ.get("NIRI_SOCKET"):
+        threading.Thread(target=focus_obsidian_niri, args=(title, vault)).start()
+
+
+def niri_obsidian_windows():
+    try:
+        out = subprocess.run(["niri", "msg", "-j", "windows"],
+                             capture_output=True, text=True, timeout=2).stdout
+        return [w for w in json.loads(out) if (w.get("app_id") or "").lower() in OBSIDIAN_APP_IDS]
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        logging.exception("niri msg windows failed")
+        return []
+
+
+def focus_obsidian_niri(title, vault):
+    """Ждёт окно Obsidian (оно может ещё запускаться) и фокусирует его в niri."""
+    # заголовок окна: "<заметка> - <хранилище> - Obsidian vX.Y.Z"
+    deadline = time.time() + FOCUS_TIMEOUT
+    fallback = None
+    while time.time() < deadline:
+        windows = niri_obsidian_windows()
+        for w in windows:
+            if (w.get("title") or "").startswith(f"{title} - {vault} - "):
+                return niri_focus(w["id"])
+        in_vault = [w for w in windows if f" - {vault} - " in (w.get("title") or "")]
+        fallback = (in_vault or windows or [None])[0]
+        time.sleep(0.2)
+    if fallback:
+        niri_focus(fallback["id"])
+    else:
+        logging.warning("obsidian window not found")
+
+
+def niri_focus(win_id):
+    logging.info("focusing window id %s", win_id)
+    subprocess.run(["niri", "msg", "action", "focus-window", "--id", str(win_id)],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def split_prefix(query):
+    """Возвращает (запрос без префикса, был ли префикс)."""
+    q = query.lstrip()
+    if not q.startswith(PREFIX):
+        return q, False
+    while q.startswith(PREFIX):
+        q = q[len(PREFIX):].lstrip()
+    return q, True
+
+
+index = Index()
+results = []  # список действий для текущей выдачи: ("open", note) | ("new", name)
+logging.info("plugin started")
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        request = json.loads(line)
+    except json.JSONDecodeError as e:
+        logging.error("json decode error: %s", e)
+        continue
+    logging.debug("received: %s", request)
+
+    if isinstance(request, dict) and "Search" in request:
+        query, full = split_prefix(request["Search"])
+        results = []
+        if not full and len(query.strip()) < GLOBAL_MIN_QUERY:
+            send("Finished")
+            continue
+        try:
+            found = index.search(query, full)
+        except Exception:
+            logging.exception("search failed")
+            found = []
+
+        for n, snippet in found:
+            where = n["vault"] + (" / " + n["folder"] if n["folder"] else "")
+            desc = f"{where} — {snippet}" if snippet else where
+            send({"Append": {
+                "id": len(results),
+                "name": n["title"],
+                "description": desc,
+                "icon": {"Name": ICON},
+            }})
+            results.append(("open", n))
+
+        q = query.strip()
+        if full and q and index.vaults and not any(n["title_l"] == q.lower() for n, _ in found):
+            send({"Append": {
+                "id": len(results),
+                "name": f"Создать заметку «{q}»",
+                "description": f"в хранилище {index.vaults[0]['name']}",
+                "icon": {"Name": "document-new"},
+            }})
+            results.append(("new", q))
+        send("Finished")
+
+    elif isinstance(request, dict) and "Activate" in request:
+        idx = request["Activate"]
+        if 0 <= idx < len(results):
+            kind, item = results[idx]
+            if kind == "open":
+                open_uri("obsidian://open?path=" + urllib.parse.quote(item["path"], safe=""),
+                         item["title"], item["vault"])
+            else:
+                vault = index.vaults[0]["name"]
+                open_uri("obsidian://new?vault=" + urllib.parse.quote(vault, safe="")
+                         + "&name=" + urllib.parse.quote(item, safe=""), item, vault)
+        send("Close")
+
+    elif isinstance(request, dict) and "Complete" in request:
+        idx = request["Complete"]
+        if 0 <= idx < len(results) and results[idx][0] == "open":
+            send({"Fill": PREFIX + results[idx][1]["title"]})
+
+    elif request == "Exit":
+        logging.info("exit received")
+        break

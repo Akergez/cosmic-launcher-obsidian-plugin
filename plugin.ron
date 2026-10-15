@@ -1,0 +1,12 @@
+(
+    name: "Obsidian",
+    description: "Поиск по заметкам Obsidian (ob <запрос> — поиск и по содержимому)",
+    bin: (
+        path: "obsidian-search",
+    ),
+    icon: Name("md.obsidian.Obsidian"),
+    query: (
+        help: "ob ",
+        no_sort: true,
+    ),
+)
